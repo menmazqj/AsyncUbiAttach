@@ -1,0 +1,336 @@
+--- ../kernel-5.10.0-45.0.0/drivers/mtd/ubi/attach.c	2022-05-10 12:16:08.458257200 +0800
++++ ../kernel-5.10.0-45.0.0/drivers/mtd/ubi/attach.c.bak	2022-05-10 11:58:25.349251576 +0800
+@@ -4,7 +4,6 @@
+  *
+  * Author: Artem Bityutskiy (Битюцкий Артём)
+  */
+-
+ /*
+  * UBI attaching sub-system.
+  *
+@@ -1361,6 +1360,278 @@
+ 	kfree(ai);
+ }
+ 
++struct ubi_async_scan_info {
++	int bad_peb_flag;
++	int empty_peb_flag;
++	int maybe_bad_peb_flag;
++};
++
++struct ubi_scan_kthread_data {
++	struct ubi_device *ubi;
++	struct ubi_attach_info *ai;
++	bool fast;
++	int pnum;
++};
++
++static int ubi_scan_peb_fn(void *data)
++{
++	struct ubi_scan_kthread_data *kdata = (struct ubi_scan_kthread_data*)data; 
++	struct ubi_device *ubi = kdata->ubi;
++	struct ubi_attach_info *ai = kdata->ai;
++	struct ubi_ec_hdr *ech = ai->ech;	
++	struct ubi_vid_io_buf *vidb = ai->vidb;
++	struct ubi_vid_hdr *vidh = ubi_get_vid_hdr(vidb);
++
++	struct ubi_async_scan_info asi = {
++		.bad_peb_flag = 0,
++		.empty_peb_flag = 0,
++		.maybe_bad_peb_flag = 0,
++	};
++
++	long long ec;
++	int err, bitflips = 0, vol_id = -1, ec_err = 0;
++	int ret_err = 0, ec_hdr_flag = 0, vid_hdr_flag = 0, check_corruption_flag = 0, pnum = 0, lnum;
++	bool fast = kdata->fast;
++	spin_lock(&ubi->pnum_lock);
++	pnum = kdata->pnum;
++	kdata->pnum += 1;
++	spin_unlock(&ubi->pnum_lock);
++	dbg_bld("scan PEB %d", pnum);//
++
++	/* Skip bad physical eraseblocks */
++	err = ubi_io_is_bad(ubi, pnum);
++	if (err < 0) {
++		ret_err = err;
++		goto err_return;
++	} else if (err) {
++		asi.bad_peb_flag = 1;
++		goto assign_attach_info;
++	}
++
++	ec_hdr_flag = 1;
++	err = ubi_io_read_ec_hdr(ubi, pnum, ech, 0);
++	if (err < 0) {
++		ret_err = err;
++		goto err_return;
++	}
++
++	switch (err) {
++	case 0:
++		break;
++	case UBI_IO_BITFLIPS:
++		bitflips = 1;
++		break;
++	case UBI_IO_FF:
++		asi.empty_peb_flag = 1;
++		goto assign_attach_info;
++	case UBI_IO_FF_BITFLIPS:
++		asi.empty_peb_flag = 1;
++		goto assign_attach_info;
++	case UBI_IO_BAD_HDR_EBADMSG:
++	case UBI_IO_BAD_HDR:
++		ec_err = err;
++		ec = UBI_UNKNOWN;
++		bitflips = 1;
++		break;
++	default:
++		ubi_err(ubi, "'ubi_io_read_ec_hdr()' returned unknown code %d", err);
++		ret_err = -EINVAL;
++		goto err_return;
++	}
++
++	if (!ec_err){
++		int image_seq;
++
++		if (ech->version != UBI_VERSION) {
++			ubi_err(ubi, "this UBI version is %d, image version is %d", UBI_VERSION, (int)ech->version);
++			ret_err = -EINVAL;
++			goto err_return;
++		}
++
++		ec = be64_to_cpu(ech->ec);
++		if (ec > UBI_MAX_ERASECOUNTER) {
++			ubi_err(ubi, "erase counter overflow, max is %d", UBI_MAX_ERASECOUNTER);
++			ubi_dump_ec_hdr(ech);
++			ret_err = -EINVAL;
++			goto err_return;
++		}
++
++		image_seq = be32_to_cpu(ech->image_seq);
++		if (!ubi->image_seq) {
++			//spin_lock(&ubi->image_seq_lock);
++			ubi->image_seq = image_seq;
++			//spin_unlock(&ubi->image_seq_lock);
++		}
++		if (image_seq && ubi->image_seq != image_seq) {
++			ubi_err(ubi, "bad image sequence number %d in PEB %d, expected %d", image_seq, pnum, ubi->image_seq);
++			ubi_dump_ec_hdr(ech);
++			ret_err = -EINVAL;
++			goto err_return;
++		}
++	}
++	ec_hdr_flag = 0;
++
++	vid_hdr_flag = 1;
++	err = ubi_io_read_vid_hdr(ubi, pnum, vidb, 0);
++	if (err < 0) {
++		ret_err = err;
++		goto err_return;
++	}
++	switch (err) {
++	case 0:
++		break;
++	case UBI_IO_BITFLIPS:
++		bitflips = 1;
++		break;
++	case UBI_IO_BAD_HDR_EBADMSG:
++		if (ec_err == UBI_IO_BAD_HDR_EBADMSG)
++			asi.maybe_bad_peb_flag = 1;
++		fallthrough;
++	case UBI_IO_BAD_HDR:
++		if (fast)
++			ai->force_full_scan = 1;
++
++		if (ec_err)
++			err = 0;
++		else
++			err = check_corruption(ubi, vidh, pnum);
++
++		if (err < 0) {
++			ret_err = err;
++			goto err_return;
++		} else {
++			check_corruption_flag = 1;
++			goto assign_attach_info;
++		}
++	case UBI_IO_FF_BITFLIPS:
++		goto assign_attach_info;
++	case UBI_IO_FF:
++		goto assign_attach_info;
++	default:
++		ubi_err(ubi, "'ubi_io_read_vid_hdr() returned unknown code %d'", err);
++		ret_err = -EINVAL;
++		goto err_return;
++	}
++	vid_hdr_flag = 0;
++
++	vol_id = be32_to_cpu(vidh->vol_id);
++	if (vol_id > UBI_MAX_VOLUMES && !vol_ignored(vol_id)) {
++		lnum = be32_to_cpu(vidh->lnum);
++
++		switch(vidh->compat) {
++		case UBI_COMPAT_DELETE:
++			ubi_msg(ubi, "\"delete\" compatible internal volume %d:%d found, will remove it", vol_id, lnum);
++			goto assign_attach_info;
++		case UBI_COMPAT_RO:
++			ubi_msg(ubi, "read-only compatible internal volume %d:%d found, switch to read-only mode", vol_id, lnum);
++			ubi->ro_mode = 1;
++			break;
++		case UBI_COMPAT_PRESERVE:
++			goto assign_attach_info;
++		case UBI_COMPAT_REJECT:
++			ubi_msg(ubi, "incompatible internal volume %d:%d found", vol_id, lnum);
++			ret_err = -EINVAL;
++			goto err_return;
++		}
++	}
++
++	if (ec_err)
++		ubi_warn(ubi, "valid VID header but corrupted EC header at PEB %d", pnum);
++
++assign_attach_info:
++	spin_lock(&ubi->ai_lock);
++	ai->bad_peb_count += asi.bad_peb_flag;
++	ai->empty_peb_count += asi.empty_peb_flag;
++	ai->maybe_bad_peb_count += asi.maybe_bad_peb_flag;
++
++	if (ec_hdr_flag) {
++		if(err == UBI_IO_FF) {
++			err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, UBI_UNKNOWN, 0, &ai->erase);
++			goto err_return;
++		}
++		if (err == UBI_IO_BITFLIPS) {
++			err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, UBI_UNKNOWN, 0, &ai->erase);
++			goto err_return;
++		}
++	} else if (vid_hdr_flag) {
++		if (check_corruption_flag) {
++			if(!err) {
++				err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, ec, 1, &ai->erase);
++			} else {
++				err = add_corrupted(ai, pnum, ec);
++			}
++			if (err){
++				ret_err = err;
++				goto err_return;
++			}
++			goto adjust_mean_ec;
++		} else if (err == UBI_IO_FF_BITFLIPS){
++			err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, ec, 1, &ai->erase);
++			if (err) {
++				ret_err = err;
++				goto err_return;
++			}
++			goto adjust_mean_ec;
++		} else if(err == UBI_IO_FF){
++			if (ec_err || bitflips)
++				err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, ec, 1, &ai->erase);
++			else
++				err = add_to_list(ai, pnum, UBI_UNKNOWN, UBI_UNKNOWN, ec, 0, &ai->free);
++			if (err) {
++				ret_err = err;
++				goto err_return;
++			}
++			goto adjust_mean_ec;
++		}
++	} else {
++		if (vidh->compat == UBI_COMPAT_DELETE) {
++			ubi_msg(ubi, "\"delete\" compatible internal volume %d:%d found, will remove it", vol_id, lnum);
++			err = add_to_list(ai, pnum, vol_id, lnum, ec, 1, &ai->erase);
++			if (err) {
++				ret_err = err;
++				goto err_return;
++			}
++			ret_err = 0;
++			goto err_return;
++		} else if(vidh->compat == UBI_COMPAT_PRESERVE) {
++			ubi_msg(ubi, "\"delete\" compatible internal volume %d:%d found, will remove it", vol_id, lnum);
++			err = add_to_list(ai, pnum, vol_id, lnum, ec, 0, &ai->alien);
++			if (err) {
++				ret_err = err;
++				goto err_return;
++			}
++			ret_err = 0;
++			goto err_return;
++		}
++	}
++
++	if (ubi_is_fm_vol(vol_id))
++		err = add_fastmap(ai, pnum, vidh, ec);
++	else
++		err = ubi_add_to_av(ubi, ai, pnum, ec, vidh, bitflips);
++	if (err) {
++		ret_err = err;
++		goto err_return;
++	}
++
++adjust_mean_ec:
++	if (!ec_err) {
++		ai->ec_sum += ec;
++		ai->ec_count += 1;
++		if (ec > ai->max_ec)
++			ai->max_ec = ec;
++		if (ec < ai->min_ec)
++			ai->min_ec = ec;
++	}
++
++err_return:
++	ai->err = err;
++	spin_unlock(&ubi->ai_lock);
++	up(&ubi->peb_sem);
++	//printk(KERN_INFO "ubi_err_return,%d\n", pnum);
++	return 0;
++}
++
+ /**
+  * scan_all - scan entire MTD device.
+  * @ubi: UBI device description object
+@@ -1378,7 +1649,15 @@
+ 	struct rb_node *rb1, *rb2;
+ 	struct ubi_ainf_volume *av;
+ 	struct ubi_ainf_peb *aeb;
+-
++	struct ubi_scan_kthread_data kdata = {
++		.ubi = ubi,
++		.ai = ai,
++		.pnum = start,
++	};
++	sema_init(&ubi->peb_sem, 100);
++	spin_lock_init(&ubi->pnum_lock);
++	spin_lock_init(&ubi->image_seq_lock);
++	spin_lock_init(&ubi->ai_lock);
+ 	err = -ENOMEM;
+ 
+ 	ai->ech = kzalloc(ubi->ec_hdr_alsize, GFP_KERNEL);
+@@ -1388,16 +1667,17 @@
+ 	ai->vidb = ubi_alloc_vid_buf(ubi, GFP_KERNEL);
+ 	if (!ai->vidb)
+ 		goto out_ech;
+-
++	
+ 	for (pnum = start; pnum < ubi->peb_count; pnum++) {
+ 		cond_resched();
+-
+-		dbg_gen("process PEB %d", pnum);
+-		err = scan_peb(ubi, ai, pnum, false);
+-		if (err < 0)
++		down(&ubi->peb_sem);
++		dbg_gen("process PEB %d", kdata.pnum);
++		kthread_run(ubi_scan_peb_fn, (void*)&kdata, "kthread scan peb %d", kdata.pnum);
++		if (ai->err < 0)
+ 			goto out_vidh;
+ 	}
++	printk(KERN_INFO "scanning is finished\n");
+ 	ubi_msg(ubi, "scanning is finished");
+ 
+ 	/* Calculate mean erase counter */
+@@ -1543,6 +1823,7 @@
+ }
+ 
+ #endif
++
+ /**
+  * ubi_attach - attach an MTD device.
+  * @ubi: UBI device descriptor
