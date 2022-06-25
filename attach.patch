@@ -1,5 +1,5 @@
---- old_attach.c	2022-06-25 00:32:32.570682292 +0800
-+++ attach.c	2022-06-25 00:34:39.526203313 +0800
+--- old_attach.c	2022-06-25 01:18:56.845298385 +0800
++++ attach.c	2022-06-25 09:37:15.114332900 +0800
 @@ -4,7 +4,6 @@
   *
   * Author: Artem Bityutskiy (Битюцкий Артём)
@@ -8,7 +8,7 @@
  /*
   * UBI attaching sub-system.
   *
-@@ -74,6 +73,12 @@
+@@ -74,6 +73,11 @@
  #include <linux/crc32.h>
  #include <linux/math64.h>
  #include <linux/random.h>
@@ -17,11 +17,10 @@
 +#include <linux/completion.h>
 +#include <linux/atomic.h>
 +#include <linux/kthread.h>
-+#include <linux/delay.h>
  #include "ubi.h"
  
  static int self_check_ai(struct ubi_device *ubi, struct ubi_attach_info *ai);
-@@ -81,7 +86,10 @@
+@@ -81,7 +85,10 @@
  #define AV_FIND		BIT(0)
  #define AV_ADD		BIT(1)
  #define AV_FIND_OR_ADD	(AV_FIND | AV_ADD)
@@ -33,7 +32,7 @@
  /**
   * find_or_add_av - internal function to find a volume, add a volume or do
   *		    both (find and add if missing).
-@@ -1361,6 +1369,277 @@
+@@ -1361,6 +1368,277 @@
  	kfree(ai);
  }
  
@@ -290,7 +289,7 @@
 +
 +	start = (kdata->ubi->peb_count / cpu) * snum;
 +	end = (kdata->ubi->peb_count / cpu) * (snum + 1);
-+	printk(KERN_INFO "start=%d, end=%d\n", start, end);
++	
 +	if (start < 0)
 +		return -1;
 +
@@ -311,7 +310,7 @@
  /**
   * scan_all - scan entire MTD device.
   * @ubi: UBI device description object
-@@ -1374,11 +1653,27 @@
+@@ -1374,11 +1652,26 @@
  static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
  		    int start)
  {
@@ -329,7 +328,6 @@
 +	};
 +	
 +	nb_available_cpus = num_online_cpus();	
-+	printk(KERN_INFO "nb_available_cpus on %d\n", nb_available_cpus);
 +	scan_threads = kmalloc_array(nb_available_cpus, sizeof(*scan_threads), GFP_KERNEL);
 +	if (!scan_threads)
 +		return -ENOMEM;
@@ -340,15 +338,14 @@
  	err = -ENOMEM;
  
  	ai->ech = kzalloc(ubi->ec_hdr_alsize, GFP_KERNEL);
-@@ -1388,16 +1683,54 @@
- 	ai->vidb = ubi_alloc_vid_buf(ubi, GFP_KERNEL);
+@@ -1389,15 +1682,41 @@
  	if (!ai->vidb)
  		goto out_ech;
-+	printk(KERN_INFO "start iter cpu\n");
  
+-	for (pnum = start; pnum < ubi->peb_count; pnum++) {
+-		cond_resched();
 +	for_each_online_cpu(cpu) {
 +		struct task_struct *thread;
-+		printk(KERN_INFO "create kthread on %d\n", cpu);
 +		thread = kthread_create_on_node(ubi_scan_peb_segment,
 +						&kdata,
 +						cpu_to_node(cpu),
@@ -361,7 +358,11 @@
 +		else
 +			ubi_err(ubi, "Failed to create async scan kthread");
 +	}
-+
+ 
+-		dbg_gen("process PEB %d", pnum);
+-		err = scan_peb(ubi, ai, pnum, false);
+-		if (err < 0)
+-			goto out_vidh;
 +	printk(KERN_INFO "finish iter cpu\n");
 +	if (nb_threads == cpu) {
 +		atomic_set(&nb_active_threads, nb_threads);
@@ -379,28 +380,13 @@
 +			if (err < 0)
 +				goto out_vidh;
 +		}
-+	}
-+
-+
-+	/*
- 	for (pnum = start; pnum < ubi->peb_count; pnum++) {
- 		cond_resched();
--
--		dbg_gen("process PEB %d", pnum);
--		err = scan_peb(ubi, ai, pnum, false);
--		if (err < 0)
-+		dbg_gen("process PEB %d", kdata.pnum);
-+		kthread_run(ubi_scan_peb_fn, (void*)&kdata, "kthread scan peb %d", kdata.pnum);
-+		if (ai->err < 0)
- 			goto out_vidh;
  	}
--
-+	*/
+ 
 +	printk(KERN_INFO "scanning is finished\n");
  	ubi_msg(ubi, "scanning is finished");
  
  	/* Calculate mean erase counter */
-@@ -1443,6 +1776,7 @@
+@@ -1443,6 +1762,7 @@
  out_vidh:
  	ubi_free_vid_buf(ai->vidb);
  out_ech:
@@ -408,7 +394,7 @@
  	kfree(ai->ech);
  	return err;
  }
-@@ -1543,6 +1877,7 @@
+@@ -1543,6 +1863,7 @@
  }
  
  #endif

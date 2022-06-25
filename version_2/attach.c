@@ -78,7 +78,6 @@
 #include <linux/completion.h>
 #include <linux/atomic.h>
 #include <linux/kthread.h>
-#include <linux/delay.h>
 #include "ubi.h"
 
 static int self_check_ai(struct ubi_device *ubi, struct ubi_attach_info *ai);
@@ -1622,7 +1621,7 @@ static int ubi_scan_peb_segment(void *data) {
 
 	start = (kdata->ubi->peb_count / cpu) * snum;
 	end = (kdata->ubi->peb_count / cpu) * (snum + 1);
-	printk(KERN_INFO "start=%d, end=%d\n", start, end);
+	
 	if (start < 0)
 		return -1;
 
@@ -1666,7 +1665,6 @@ static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
 	};
 	
 	nb_available_cpus = num_online_cpus();	
-	printk(KERN_INFO "nb_available_cpus on %d\n", nb_available_cpus);
 	scan_threads = kmalloc_array(nb_available_cpus, sizeof(*scan_threads), GFP_KERNEL);
 	if (!scan_threads)
 		return -ENOMEM;
@@ -1683,11 +1681,9 @@ static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
 	ai->vidb = ubi_alloc_vid_buf(ubi, GFP_KERNEL);
 	if (!ai->vidb)
 		goto out_ech;
-	printk(KERN_INFO "start iter cpu\n");
 
 	for_each_online_cpu(cpu) {
 		struct task_struct *thread;
-		printk(KERN_INFO "create kthread on %d\n", cpu);
 		thread = kthread_create_on_node(ubi_scan_peb_segment,
 						&kdata,
 						cpu_to_node(cpu),
@@ -1720,16 +1716,6 @@ static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
 		}
 	}
 
-
-	/*
-	for (pnum = start; pnum < ubi->peb_count; pnum++) {
-		cond_resched();
-		dbg_gen("process PEB %d", kdata.pnum);
-		kthread_run(ubi_scan_peb_fn, (void*)&kdata, "kthread scan peb %d", kdata.pnum);
-		if (ai->err < 0)
-			goto out_vidh;
-	}
-	*/
 	printk(KERN_INFO "scanning is finished\n");
 	ubi_msg(ubi, "scanning is finished");
 
