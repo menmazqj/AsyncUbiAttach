@@ -1,5 +1,17 @@
---- old_attach.c	2022-06-25 01:18:56.845298385 +0800
-+++ attach.c	2022-06-25 09:37:15.114332900 +0800
+From f344d1054a43bea4c608fb7ceaf7f17892a23455 Mon Sep 17 00:00:00 2001
+From: root <root@localhost.localdomain>
+Date: Sun, 26 Jun 2022 17:12:11 +0800
+Subject: [PATCH] async scan v2
+
+---
+ drivers/mtd/ubi/attach.c | 338 +++++++++++++++++++++++++++++++++++++--
+ drivers/mtd/ubi/ubi.h    |  15 +-
+ 2 files changed, 343 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/mtd/ubi/attach.c b/drivers/mtd/ubi/attach.c
+index ae5abe492b52..f9f21bec97ca 100644
+--- a/drivers/mtd/ubi/attach.c
++++ b/drivers/mtd/ubi/attach.c
 @@ -4,7 +4,6 @@
   *
   * Author: Artem Bityutskiy (Битюцкий Артём)
@@ -20,19 +32,19 @@
  #include "ubi.h"
  
  static int self_check_ai(struct ubi_device *ubi, struct ubi_attach_info *ai);
-@@ -81,7 +85,10 @@
+@@ -81,7 +85,10 @@ static int self_check_ai(struct ubi_device *ubi, struct ubi_attach_info *ai);
  #define AV_FIND		BIT(0)
  #define AV_ADD		BIT(1)
  #define AV_FIND_OR_ADD	(AV_FIND | AV_ADD)
 -
 +static atomic_t nb_active_threads;
-+static int cpu;
++//static int cpu;
 +static struct completion scan_threads_done = 
 +	COMPLETION_INITIALIZER(scan_threads_done);
  /**
   * find_or_add_av - internal function to find a volume, add a volume or do
   *		    both (find and add if missing).
-@@ -1361,6 +1368,277 @@
+@@ -1361,6 +1368,277 @@ static void destroy_ai(struct ubi_attach_info *ai)
  	kfree(ai);
  }
  
@@ -310,7 +322,7 @@
  /**
   * scan_all - scan entire MTD device.
   * @ubi: UBI device description object
-@@ -1374,11 +1652,26 @@
+@@ -1374,11 +1652,26 @@ static void destroy_ai(struct ubi_attach_info *ai)
  static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
  		    int start)
  {
@@ -320,7 +332,7 @@
  	struct ubi_ainf_volume *av;
  	struct ubi_ainf_peb *aeb;
 +	struct task_struct **scan_threads;
- 
++
 +	struct ubi_scan_kthread_data kdata = {
 +		.ubi = ubi,
 +		.ai = ai,
@@ -331,14 +343,14 @@
 +	scan_threads = kmalloc_array(nb_available_cpus, sizeof(*scan_threads), GFP_KERNEL);
 +	if (!scan_threads)
 +		return -ENOMEM;
-+
+ 
 +	spin_lock_init(&ai->snum_lock);
 +	spin_lock_init(&ubi->image_seq_lock);
 +	spin_lock_init(&ubi->ai_lock);
  	err = -ENOMEM;
  
  	ai->ech = kzalloc(ubi->ec_hdr_alsize, GFP_KERNEL);
-@@ -1389,15 +1682,41 @@
+@@ -1389,15 +1682,41 @@ static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
  	if (!ai->vidb)
  		goto out_ech;
  
@@ -350,7 +362,11 @@
 +						&kdata,
 +						cpu_to_node(cpu),
 +						"scan peb segment_%d", cpu);
-+
+ 
+-		dbg_gen("process PEB %d", pnum);
+-		err = scan_peb(ubi, ai, pnum, false);
+-		if (err < 0)
+-			goto out_vidh;
 +		if (thread) {
 +			scan_threads[nb_threads++] = thread;
 +			kthread_bind(thread, cpu);
@@ -358,11 +374,7 @@
 +		else
 +			ubi_err(ubi, "Failed to create async scan kthread");
 +	}
- 
--		dbg_gen("process PEB %d", pnum);
--		err = scan_peb(ubi, ai, pnum, false);
--		if (err < 0)
--			goto out_vidh;
++
 +	printk(KERN_INFO "finish iter cpu\n");
 +	if (nb_threads == cpu) {
 +		atomic_set(&nb_active_threads, nb_threads);
@@ -386,7 +398,7 @@
  	ubi_msg(ubi, "scanning is finished");
  
  	/* Calculate mean erase counter */
-@@ -1443,6 +1762,7 @@
+@@ -1443,6 +1762,7 @@ static int scan_all(struct ubi_device *ubi, struct ubi_attach_info *ai,
  out_vidh:
  	ubi_free_vid_buf(ai->vidb);
  out_ech:
@@ -394,11 +406,67 @@
  	kfree(ai->ech);
  	return err;
  }
-@@ -1543,6 +1863,7 @@
- }
+diff --git a/drivers/mtd/ubi/ubi.h b/drivers/mtd/ubi/ubi.h
+index 078112e23dfd..f01ee0f9c14d 100644
+--- a/drivers/mtd/ubi/ubi.h
++++ b/drivers/mtd/ubi/ubi.h
+@@ -27,6 +27,7 @@
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/ubi.h>
+ #include <linux/pgtable.h>
++#include <linux/semaphore.h>
  
- #endif
+ #include "ubi-media.h"
+ 
+@@ -388,6 +389,8 @@ struct ubi_volume_desc {
+ 	int mode;
+ };
+ 
++struct ubi_wl_entry;
 +
  /**
-  * ubi_attach - attach an MTD device.
-  * @ubi: UBI device descriptor
+  * struct ubi_debug_info - debugging information for an UBI device.
+  *
+@@ -489,7 +492,8 @@ struct ubi_debug_info {
+  * @fm_work: fastmap work queue
+  * @fm_work_scheduled: non-zero if fastmap work was scheduled
+  * @fast_attach: non-zero if UBI was attached by fastmap
+- * @fm_anchor: The next anchor PEB to use for fastmap
++ * @fm_anchor: The new anchor PEB used during fastmap update
++ * @fm_next_anchor: An anchor PEB candidate for the next time fastmap is updated
+  * @fm_do_produce_anchor: If true produce an anchor PEB in wl
+  *
+  * @used: RB-tree of used physical eraseblocks
+@@ -600,6 +604,7 @@ struct ubi_device {
+ 	int fm_work_scheduled;
+ 	int fast_attach;
+ 	struct ubi_wl_entry *fm_anchor;
++	struct ubi_wl_entry *fm_next_anchor;
+ 	int fm_do_produce_anchor;
+ 
+ 	/* Wear-leveling sub-system's stuff */
+@@ -624,6 +629,12 @@ struct ubi_device {
+ 	int thread_enabled;
+ 	char bgt_name[sizeof(UBI_BGT_NAME_PATTERN)+2];
+ 
++	/* async scan's stuff */
++	struct semaphore peb_sem;
++	spinlock_t pnum_lock;
++	spinlock_t image_seq_lock;
++	spinlock_t ai_lock;
++
+ 	/* I/O sub-system's stuff */
+ 	long long flash_size;
+ 	int peb_count;
+@@ -781,6 +792,8 @@ struct ubi_attach_info {
+ 	struct kmem_cache *aeb_slab_cache;
+ 	struct ubi_ec_hdr *ech;
+ 	struct ubi_vid_io_buf *vidb;
++	/* async scan's stuff */
++	spinlock_t snum_lock;
+ };
+ 
+ /**
+-- 
+2.30.0
+
