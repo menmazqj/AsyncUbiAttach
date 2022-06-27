@@ -38,7 +38,7 @@ index ae5abe492b52..f9f21bec97ca 100644
  #define AV_FIND_OR_ADD	(AV_FIND | AV_ADD)
 -
 +static atomic_t nb_active_threads;
-+//static int cpu;
++static int cpu;
 +static struct completion scan_threads_done = 
 +	COMPLETION_INITIALIZER(scan_threads_done);
  /**
